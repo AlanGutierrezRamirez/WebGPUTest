@@ -3,63 +3,92 @@
 <body>
     <canvas id="canvas" width="600" height="600"></canvas>
     <script type="module">
-        async function init() {
-            // 1. Check if WebGPU is available
-            if (!navigator.gpu) {
-                alert("WebGPU not supported! Update your browser.");
-                return;
+    async function init() {
+        if (!navigator.gpu) { alert("WebGPU not supported!"); return; }
+
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice();
+        const canvas = document.getElementById("canvas");
+        const context = canvas.getContext("webgpu");
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        
+        context.configure({ device: device, format: format });
+
+        // --- 1. THE PHYSICS DATA (CPU Side) ---
+        // Simple Physics State
+        let x = 0.0;
+        let y = 0.0;
+        let velocityX = 0.01;
+        let velocityY = 0.015;
+
+        // We need a buffer to send these (x, y) numbers to the GPU
+        // 2 floats = 8 bytes
+        const uniformBuffer = device.createBuffer({
+            size: 8, 
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // --- 2. THE SHADER (GPU Side) ---
+        // We added a 'struct' to receive the position from JS
+        const shaderCode = `
+            struct Position {
+                offset: vec2f,
+            };
+            
+            @group(0) @binding(0) var<uniform> player: Position;
+
+            @vertex
+            fn vs_main(@builtin(vertex_index) id : u32) -> @builtin(position) vec4f {
+                var pos = array<vec2f, 3>(
+                    vec2f( 0.0,  0.2),  // Top
+                    vec2f(-0.2, -0.2),  // Bottom Left
+                    vec2f( 0.2, -0.2)   // Bottom Right
+                );
+                
+                // PHYSICS MAGIC: Add the offset to the original position
+                let newPos = pos[id] + player.offset;
+                
+                return vec4f(newPos, 0.0, 1.0);
             }
 
-            // 2. Setup the "Adapter" (The physical GPU)
-            const adapter = await navigator.gpu.requestAdapter();
-            const device = await adapter.requestDevice();
+            @fragment
+            fn fs_main() -> @location(0) vec4f {
+                return vec4f(0.2, 0.8, 1.0, 1.0); // Cyan
+            }
+        `;
 
-            // 3. Setup the Canvas
-            const canvas = document.getElementById("canvas");
-            const context = canvas.getContext("webgpu");
-            const format = navigator.gpu.getPreferredCanvasFormat();
-            
-            context.configure({
-                device: device,
-                format: format,
-            });
+        const module = device.createShaderModule({ code: shaderCode });
 
-            // 4. The Shader (WGSL Code - Looks like Rust/C)
-            const shaderCode = `
-                @vertex
-                fn vs_main(@builtin(vertex_index) id : u32) -> @builtin(position) vec4f {
-                    // Simple triangle coordinates
-                    var pos = array<vec2f, 3>(
-                        vec2f( 0.0,  0.5),  // Top
-                        vec2f(-0.5, -0.5),  // Bottom Left
-                        vec2f( 0.5, -0.5)   // Bottom Right
-                    );
-                    return vec4f(pos[id], 0.0, 1.0);
-                }
+        // --- 3. THE PIPELINE ---
+        const pipeline = device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: module, entryPoint: "vs_main" },
+            fragment: { module: module, entryPoint: "fs_main", targets: [{ format: format }] },
+            primitive: { topology: "triangle-list" },
+        });
 
-                @fragment
-                fn fs_main() -> @location(0) vec4f {
-                    return vec4f(0.2, 0.6, 1.0, 1.0); // Nice Blue Color
-                }
-            `;
+        // Create a "Bind Group" (This links the Buffer to the Shader)
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+        });
 
-            // 5. Create the Pipeline (Compile the shader)
-            const module = device.createShaderModule({ code: shaderCode });
-            const pipeline = device.createRenderPipeline({
-                layout: "auto",
-                vertex: {
-                    module: module,
-                    entryPoint: "vs_main",
-                },
-                fragment: {
-                    module: module,
-                    entryPoint: "fs_main",
-                    targets: [{ format: format }],
-                },
-                primitive: { topology: "triangle-list" },
-            });
+        // --- 4. THE GAME LOOP ---
+        function frame() {
+            // A. Update Physics (CPU)
+            x += velocityX;
+            y += velocityY;
 
-            // 6. The Render Loop
+            // Simple Collision Detection (Screen is -1.0 to 1.0)
+            // If we hit the wall, reverse velocity
+            if (x > 0.8 || x < -0.8) velocityX *= -1;
+            if (y > 0.8 || y < -0.8) velocityY *= -1;
+
+            // B. Send Data to GPU
+            const data = new Float32Array([x, y]);
+            device.queue.writeBuffer(uniformBuffer, 0, data);
+
+            // C. Draw
             const commandEncoder = device.createCommandEncoder();
             const textureView = context.getCurrentTexture().createView();
 
@@ -67,19 +96,27 @@
                 colorAttachments: [{
                     view: textureView,
                     loadOp: "clear",
-                    clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, // Black Background
+                    clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
                     storeOp: "store",
                 }],
             });
 
             passEncoder.setPipeline(pipeline);
-            passEncoder.draw(3); // Draw 3 vertices (1 Triangle)
+            passEncoder.setBindGroup(0, bindGroup); // Tell GPU to use our updated numbers
+            passEncoder.draw(3);
             passEncoder.end();
 
             device.queue.submit([commandEncoder.finish()]);
+            
+            // Loop forever
+            requestAnimationFrame(frame);
         }
 
-        init();
-    </script>
+        // Start the engine
+        requestAnimationFrame(frame);
+    }
+
+    init();
+</script>
 </body>
 </html>
