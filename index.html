@@ -1,462 +1,474 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="en">
 <head>
-    <title>WebGPU 3D OBJ Viewer</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Giant Minty Blob (WebGL Edition)</title>
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght=400;700;800;900&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-cloud: #F0F4F8;
+            --color-mint: #6BCB77; 
+            --text-dark: #2D3436;
+        }
+
         body {
-            background: #111;
-            color: white;
+            margin: 0;
+            overflow: hidden;
+            background-color: var(--bg-cloud);
+            /* Static background pattern */
+            background-image: radial-gradient(#DDE1E7 15%, transparent 16%);
+            background-size: 20px 20px;
+            font-family: 'Nunito', sans-serif;
             display: flex;
-            flex-direction: column;
+            justify-content: center;
             align-items: center;
             height: 100vh;
-            margin: 0;
-            font-family: system-ui, sans-serif;
-            overflow: hidden; /* Prevent scrollbars during resize */
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none; /* Critical for iPad performance */
         }
 
-        canvas {
-            border: 1px solid #333;
-            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
-            margin-bottom: 20px;
-            display: block;
+        #game-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
         }
 
-        #controls {
-            background: #222;
-            padding: 20px;
-            border-radius: 8px;
-            text-align: center;
-            z-index: 10;
+        /* Layer 1: WebGL Canvas (The Gooey Body) */
+        canvas#glCanvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 1;
         }
 
-        #error-log {
-            position: fixed;
-            top: 10px;
-            left: 10px;
-            color: #ff5555;
-            background: rgba(0, 0, 0, 0.9);
-            padding: 15px;
-            border-radius: 4px;
-            display: none;
-            max-width: 400px;
-            font-family: monospace;
-            white-space: pre-wrap;
-            z-index: 100;
+        /* Layer 2: 2D Canvas (The Face & Eyes) */
+        canvas#uiCanvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 2;
+            cursor: grab;
         }
+        canvas#uiCanvas:active {
+            cursor: grabbing;
+        }
+
+        /* Pause Button */
+        .pause-btn {
+            position: absolute; top: 20px; right: 20px; z-index: 100;
+            width: 50px; height: 50px; border-radius: 50%;
+            background: white; border: none;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+        .pause-btn:active { transform: scale(0.95); }
+        .pause-btn svg { width: 24px; height: 24px; fill: #2D3436; }
+
     </style>
 </head>
-
 <body>
-    <div id="error-log"></div>
-    <canvas id="canvas" width="800" height="600"></canvas>
 
-    <div id="controls">
-        <h3>Upload .OBJ File</h3>
-        <input type="file" id="model-input" accept=".obj">
-        <p style="font-size: 0.8rem; color: #888;">Supports: v, f (auto-triangulates)</p>
+    <div id="game-container">
+        <canvas id="glCanvas"></canvas>
+        <canvas id="uiCanvas"></canvas>
     </div>
 
-    <script type="module">
-        // --- MATRIX MATH HELPERS (Column-Major for WebGPU) ---
-        const mat4 = {
-            perspective: (fovy, aspect, near, far) => {
-                const f = 1.0 / Math.tan(fovy / 2);
-                const out = new Float32Array(16);
-                out[0] = f / aspect;
-                out[5] = f;
-                out[10] = (far + near) / (near - far); // Z normalization for WebGPU (0 to 1) often different than GL (-1 to 1)
-                // WebGPU clip space Z is 0..1. The standard GL projection puts Z in -1..1.
-                // For WebGPU specifically:
-                out[10] = far / (near - far);
-                out[11] = -1;
-                out[14] = (near * far) / (near - far);
-                return out;
-            },
-            multiply: (a, b) => {
-                // strict column-major multiplication
-                const out = new Float32Array(16);
-                const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3];
-                const a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
-                const a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
-                const a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+    <button class="pause-btn" onclick="location.reload()">
+        <svg viewBox="0 0 24 24"><path d="M12 5V19M5 12H19" stroke="#2D3436" stroke-width="3" stroke-linecap="round"/></svg>
+    </button>
 
-                let b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
-                out[0] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
-                out[1] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
-                out[2] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
-                out[3] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+    <script>
+        // --- CONFIGURATION ---
+        const POINTS = 60;        // Resolution of the main blob
+        const DRIPS = 6;          // Number of background drips
+        const TOTAL_POINTS = POINTS + DRIPS;
+        
+        const HEAD_RADIUS = 160;
+        const VISCOSITY = 0.92;   // "Jiggle" damping
+        const ELASTICITY = 0.05;  // Snap back force
 
-                b0 = b[4]; b1 = b[5]; b2 = b[6]; b3 = b[7];
-                out[4] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
-                out[5] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
-                out[6] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
-                out[7] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+        // --- PHYSICS STATE ---
+        const points = [];
+        let width, height, centerX, centerY;
+        let isDragging = false, dragPoint = null;
+        let mouseX = 0, mouseY = 0;
+        let currentStress = 0;
+        let wobbleTimer = 0;
 
-                b0 = b[8]; b1 = b[9]; b2 = b[10]; b3 = b[11];
-                out[8] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
-                out[9] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
-                out[10] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
-                out[11] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
-
-                b0 = b[12]; b1 = b[13]; b2 = b[14]; b3 = b[15];
-                out[12] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
-                out[13] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
-                out[14] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
-                out[15] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
-                return out;
-            },
-            rotateY: (angle) => {
-                const c = Math.cos(angle), s = Math.sin(angle);
-                // Column-major layout
-                return new Float32Array([
-                    c, 0, -s, 0,
-                    0, 1, 0, 0,
-                    s, 0, c, 0,
-                    0, 0, 0, 1
-                ]);
-            },
-            rotateX: (angle) => {
-                const c = Math.cos(angle), s = Math.sin(angle);
-                return new Float32Array([
-                    1, 0, 0, 0,
-                    0, c, s, 0,
-                    0, -s, c, 0,
-                    0, 0, 0, 1
-                ]);
-            },
-            translation: (x, y, z) => {
-                return new Float32Array([
-                    1, 0, 0, 0,
-                    0, 1, 0, 0,
-                    0, 0, 1, 0,
-                    x, y, z, 1
-                ]);
+        // --- WEBGL SHADERS ---
+        
+        // 1. Vertex Shader (Draws a simple rectangle over the screen)
+        const vsSource = `
+            attribute vec2 a_position;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
             }
-        };
+        `;
 
-        // --- ERROR LOGGING ---
-        function logError(msg) {
-            const el = document.getElementById("error-log");
-            el.innerText += msg + "\n";
-            el.style.display = "block";
-            console.error(msg);
-        }
-
-        // --- MESH NORMALIZATION ---
-        function normalizeMesh(vertices) {
-            let minX = Infinity, minY = Infinity, minZ = Infinity;
-            let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-            // Stride is 6 (x,y,z, r,g,b)
-            for (let i = 0; i < vertices.length; i += 6) {
-                const x = vertices[i], y = vertices[i + 1], z = vertices[i + 2];
-                if (x < minX) minX = x;
-                if (y < minY) minY = y;
-                if (z < minZ) minZ = z;
-                if (x > maxX) maxX = x;
-                if (y > maxY) maxY = y;
-                if (z > maxZ) maxZ = z;
-            }
-
-            const sizeX = maxX - minX, sizeY = maxY - minY, sizeZ = maxZ - minZ;
-            const maxDim = Math.max(sizeX, sizeY, sizeZ) || 1.0;
-            const scale = 2.0 / maxDim; // Scale to fit in 2x2x2 box
-
-            const centerX = (minX + maxX) / 2;
-            const centerY = (minY + maxY) / 2;
-            const centerZ = (minZ + maxZ) / 2;
-
-            for (let i = 0; i < vertices.length; i += 6) {
-                vertices[i] = (vertices[i] - centerX) * scale;
-                vertices[i + 1] = (vertices[i + 1] - centerY) * scale;
-                vertices[i + 2] = (vertices[i + 2] - centerZ) * scale;
-            }
-            return vertices;
-        }
-
-        // --- OBJ PARSER ---
-        function parseOBJ(text) {
-            const positions = [];
-            const vertices = [];
-
-            const lines = text.split('\n');
-            for (let line of lines) {
-                line = line.trim();
-                if (!line || line.startsWith('#')) continue;
-
-                // Robust splitting by whitespace
-                const parts = line.split(/\s+/);
-                const type = parts[0];
-
-                if (type === 'v') {
-                    // v x y z
-                    positions.push([
-                        parseFloat(parts[1]), 
-                        parseFloat(parts[2]), 
-                        parseFloat(parts[3])
-                    ]);
-                } else if (type === 'f') {
-                    // f v1/vt1/vn1 v2/...
-                    const faceIndices = parts.slice(1);
-                    // Triangulate fan (assumes convex polygon)
-                    for (let i = 1; i < faceIndices.length - 1; i++) {
-                        const idx0 = parseInt(faceIndices[0].split('/')[0]) - 1;
-                        const idx1 = parseInt(faceIndices[i].split('/')[0]) - 1;
-                        const idx2 = parseInt(faceIndices[i + 1].split('/')[0]) - 1;
-
-                        [idx0, idx1, idx2].forEach(idx => {
-                            if (!positions[idx]) return;
-                            const p = positions[idx];
-                            // x, y, z
-                            vertices.push(p[0], p[1], p[2]);
-                            
-                            // Generate a pleasing Color based on normals or positions
-                            // Using position-based coloring for simplicity
-                            vertices.push(
-                                0.5 + p[0] * 0.5, 
-                                0.5 + p[1] * 0.5, 
-                                0.5 + p[2] * 0.5
-                            );
-                        });
-                    }
-                }
-            }
-            return normalizeMesh(new Float32Array(vertices));
-        }
-
-        // --- GLOBAL STATE ---
-        let device, context, pipeline, uniformBindGroup, uniformBuffer, depthTexture, format;
-        let vertexBuffer;
-        let vertexCount = 0;
-        const canvas = document.getElementById("canvas");
-
-        async function init() {
-            try {
-                if (!navigator.gpu) throw new Error("WebGPU not supported in this browser.");
-
-                const adapter = await navigator.gpu.requestAdapter();
-                if (!adapter) throw new Error("No GPU adapter found!");
-
-                device = await adapter.requestDevice();
-                device.lost.then((info) => logError(`Device lost: ${info.message}`));
-
-                context = canvas.getContext("webgpu");
-                format = navigator.gpu.getPreferredCanvasFormat();
-                context.configure({ device, format, alphaMode: 'premultiplied' });
-
-                // Start with a Cube
-                const defaultCube = `
-v -1.0 -1.0  1.0
-v  1.0 -1.0  1.0
-v  1.0  1.0  1.0
-v -1.0  1.0  1.0
-v -1.0 -1.0 -1.0
-v -1.0  1.0 -1.0
-v  1.0  1.0 -1.0
-v  1.0 -1.0 -1.0
-f 1 2 3 4
-f 5 6 7 8
-f 1 5 8 2
-f 2 8 7 3
-f 3 7 6 4
-f 5 1 4 6
-                `;
-                loadMesh(parseOBJ(defaultCube));
-
-                setupPipeline();
-                
-                // Handle Window Resizing
-                window.addEventListener('resize', onResize);
-                onResize(); // Set initial size
-
-                requestAnimationFrame(frame);
-
-            } catch (e) {
-                logError(e.message);
-            }
-        }
-
-        function onResize() {
-            // Resize canvas to display size for sharp rendering
-            const width = Math.min(window.innerWidth * 0.9, 1024);
-            const height = Math.min(window.innerHeight * 0.7, 768);
+        // 2. Fragment Shader (Calculates the "Goo" math per pixel)
+        const fsSource = `
+            precision mediump float;
             
-            canvas.width = width;
-            canvas.height = height;
+            uniform vec2 u_resolution;
+            uniform vec2 u_points[${TOTAL_POINTS}]; // Array of all point positions
+            uniform float u_stress;
+            
+            // "Smooth Minimum" function - blends shapes together like liquid
+            float smin(float a, float b, float k) {
+                float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+                return mix(b, a, h) - k * h * (1.0 - h);
+            }
 
-            // Recreate Depth Texture to match new size
-            if (device) {
-                if (depthTexture) depthTexture.destroy();
-                depthTexture = device.createTexture({
-                    size: [canvas.width, canvas.height],
-                    format: 'depth24plus',
-                    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            void main() {
+                // Fix coordinates (WebGL 0,0 is bottom-left, we want top-left)
+                vec2 uv = gl_FragCoord.xy;
+                uv.y = u_resolution.y - uv.y;
+
+                float d = 10000.0;
+                
+                // Check distance to every point
+                for (int i = 0; i < ${TOTAL_POINTS}; i++) {
+                    float dist = distance(uv, u_points[i]);
+                    
+                    // Main blob points are smaller, Drips (last 6) are bigger
+                    float radius = (i >= ${POINTS}) ? 70.0 : 25.0; 
+                    
+                    // Blend them! 60.0 is the "Goo Factor"
+                    d = smin(d, dist - radius, 60.0);
+                }
+
+                // Hard edge cutoff
+                float alpha = 1.0 - smoothstep(0.0, 2.0, d);
+                
+                if (alpha < 0.1) discard; // Transparent background
+
+                // Colors
+                vec3 mint = vec3(0.42, 0.8, 0.47);   // #6BCB77
+                vec3 red  = vec3(0.8, 0.36, 0.36);   // Stress Color
+
+                // Mix color based on stress
+                vec3 color = mix(mint, red, u_stress * 0.8);
+
+                // Fake 3D lighting (darker edges, lighter center)
+                float depth = clamp(-d / 100.0, 0.0, 1.0); 
+                color = mix(color * 0.8, color * 1.2, depth);
+
+                // Dark outline
+                float outline = smoothstep(-4.0, 0.0, d);
+                color = mix(color, color * 0.6, outline);
+
+                gl_FragColor = vec4(color, 1.0);
+            }
+        `;
+
+        // --- INITIALIZATION ---
+
+        const glCanvas = document.getElementById('glCanvas');
+        const uiCanvas = document.getElementById('uiCanvas');
+        const gl = glCanvas.getContext('webgl');
+        const uiCtx = uiCanvas.getContext('2d');
+
+        // Compile Shader Helper
+        function createShader(gl, type, source) {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, source);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(s));
+                return null;
+            }
+            return s;
+        }
+
+        // Setup WebGL Program
+        const program = gl.createProgram();
+        gl.attachShader(program, createShader(gl, gl.VERTEX_SHADER, vsSource));
+        gl.attachShader(program, createShader(gl, gl.FRAGMENT_SHADER, fsSource));
+        gl.linkProgram(program);
+        gl.useProgram(program);
+
+        // Look up variable locations
+        const posLoc = gl.getAttribLocation(program, "a_position");
+        const resLoc = gl.getUniformLocation(program, "u_resolution");
+        const ptsLoc = gl.getUniformLocation(program, "u_points");
+        const strLoc = gl.getUniformLocation(program, "u_stress");
+
+        // Create a screen-filling rectangle
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1, -1,  1, -1,  -1, 1,
+            -1, 1,   1, -1,   1, 1
+        ]), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(posLoc);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+
+        // --- PHYSICS LOGIC ---
+
+        function initPoints() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            centerX = width / 2;
+            centerY = height / 2;
+            points.length = 0;
+
+            // 1. Main Blob Ring
+            for (let i = 0; i < POINTS; i++) {
+                const a = (Math.PI * 2 * i) / POINTS;
+                let r = HEAD_RADIUS;
+                // Add uneven shape
+                if (Math.sin(a) > 0) r += Math.sin(a)*40 + Math.sin(a*5)*10;
+
+                const hx = Math.cos(a) * r;
+                const hy = Math.sin(a) * r * 0.9;
+                
+                points.push({
+                    x: centerX + hx, y: centerY + hy,
+                    ox: centerX + hx, oy: centerY + hy, // old position (for velocity)
+                    hx: hx, hy: hy, // home position (relative to center)
+                    drip: false
+                });
+            }
+
+            // 2. Background Drips
+            for(let i = 0; i < DRIPS; i++) {
+                // Random positions
+                const rx = (Math.random() - 0.5) * width;
+                const ry = (Math.random() - 0.5) * height;
+                points.push({
+                    x: centerX + rx, y: centerY + ry,
+                    ox: centerX + rx, oy: centerY + ry,
+                    hx: rx, hy: ry,
+                    drip: true
                 });
             }
         }
 
-        function loadMesh(data) {
-            if (data.length === 0) {
-                logError("Mesh has 0 vertices.");
-                return;
+        function updatePhysics() {
+            if (wobbleTimer > 0) wobbleTimer--;
+
+            // Calculate Blob Center
+            let avgX = 0, avgY = 0;
+            for(let i=0; i<POINTS; i++) { avgX += points[i].x; avgY += points[i].y; }
+            avgX /= POINTS; avgY /= POINTS;
+
+            // Stress Calculation
+            if(isDragging && dragPoint && !dragPoint.drip) {
+                const d = Math.hypot(dragPoint.x - avgX, dragPoint.y - avgY);
+                currentStress = Math.min(1, Math.max(0, (d - 160) / 150));
+            } else {
+                currentStress *= 0.95; // Decay
             }
-            vertexCount = data.length / 6;
 
-            // Cleanup old buffer
-            if (vertexBuffer) vertexBuffer.destroy();
+            // Point Physics
+            for(let i=0; i<TOTAL_POINTS; i++) {
+                let p = points[i];
 
-            vertexBuffer = device.createBuffer({
-                size: data.byteLength,
-                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-            device.queue.writeBuffer(vertexBuffer, 0, data);
-            console.log(`Mesh loaded: ${vertexCount} vertices`);
-        }
+                if(p === dragPoint) {
+                    p.x = mouseX; p.y = mouseY;
+                    p.ox = p.x; p.oy = p.y;
+                } else {
+                    // Verlet Integration (Inertia)
+                    let vx = (p.x - p.ox) * VISCOSITY;
+                    let vy = (p.y - p.oy) * VISCOSITY;
+                    p.ox = p.x; p.oy = p.y;
+                    p.x += vx; p.y += vy;
 
-        function setupPipeline() {
-            uniformBuffer = device.createBuffer({
-                size: 64, // 4x4 matrix
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            });
-
-            const shaderCode = `
-                struct Uniforms {
-                    modelViewProjectionMatrix : mat4x4<f32>,
-                }
-                @binding(0) @group(0) var<uniform> uniforms : Uniforms;
-
-                struct VertexOutput {
-                    @builtin(position) Position : vec4<f32>,
-                    @location(0) color : vec4<f32>,
-                }
-
-                @vertex
-                fn vs_main(@location(0) position : vec3<f32>, @location(1) color : vec3<f32>) -> VertexOutput {
-                    var output : VertexOutput;
-                    output.Position = uniforms.modelViewProjectionMatrix * vec4<f32>(position, 1.0);
-                    output.color = vec4<f32>(color, 1.0);
-                    return output;
-                }
-
-                @fragment
-                fn fs_main(@location(0) color : vec4<f32>) -> @location(0) vec4<f32> {
-                    return color;
-                }
-            `;
-
-            const module = device.createShaderModule({ code: shaderCode });
-
-            pipeline = device.createRenderPipeline({
-                layout: 'auto',
-                vertex: {
-                    module: module,
-                    entryPoint: 'vs_main',
-                    buffers: [{
-                        arrayStride: 24, // 3*4 + 3*4
-                        attributes: [
-                            { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
-                            { shaderLocation: 1, offset: 12, format: 'float32x3' } // color
-                        ]
-                    }]
-                },
-                fragment: {
-                    module: module,
-                    entryPoint: 'fs_main',
-                    targets: [{ format: format }]
-                },
-                primitive: {
-                    topology: 'triangle-list',
-                    cullMode: 'none', 
-                },
-                depthStencil: {
-                    depthWriteEnabled: true,
-                    depthCompare: 'less',
-                    format: 'depth24plus',
-                }
-            });
-
-            uniformBindGroup = device.createBindGroup({
-                layout: pipeline.getBindGroupLayout(0),
-                entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
-            });
-        }
-
-        function frame() {
-            if (!device || !pipeline || !depthTexture) return;
-            const now = Date.now() / 1000;
-
-            const aspect = canvas.width / canvas.height;
-            const projectionMatrix = mat4.perspective(Math.PI / 4, aspect, 0.1, 100.0);
-
-            // Camera View: move back 3 units
-            const viewMatrix = mat4.translation(0, 0, -3.5);
-
-            // Rotate Model
-            const rotationX = mat4.rotateX(now * 0.5);
-            const rotationY = mat4.rotateY(now * 0.8);
-            const modelMatrix = mat4.multiply(rotationX, rotationY);
-
-            // Combine: MVP = Projection * View * Model
-            const modelView = mat4.multiply(viewMatrix, modelMatrix);
-            const modelViewProjection = mat4.multiply(projectionMatrix, modelView);
-
-            device.queue.writeBuffer(uniformBuffer, 0, modelViewProjection);
-
-            const commandEncoder = device.createCommandEncoder();
-            const textureView = context.getCurrentTexture().createView();
-
-            const passEncoder = commandEncoder.beginRenderPass({
-                colorAttachments: [{
-                    view: textureView,
-                    // Clear to Dark Gray
-                    clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
-                    loadOp: 'clear',
-                    storeOp: 'store',
-                }],
-                depthStencilAttachment: {
-                    view: depthTexture.createView(),
-                    depthClearValue: 1.0,
-                    depthLoadOp: 'clear',
-                    depthStoreOp: 'store',
-                }
-            });
-
-            passEncoder.setPipeline(pipeline);
-            passEncoder.setBindGroup(0, uniformBindGroup);
-            passEncoder.setVertexBuffer(0, vertexBuffer);
-            passEncoder.draw(vertexCount);
-            passEncoder.end();
-
-            device.queue.submit([commandEncoder.finish()]);
-            requestAnimationFrame(frame);
-        }
-
-        // --- FILE INPUT HANDLER ---
-        document.getElementById('model-input').addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                const text = event.target.result;
-                try {
-                    const meshData = parseOBJ(text);
-                    if (meshData.length > 0) {
-                        loadMesh(meshData);
-                    } else {
-                        logError("No valid geometry found.");
+                    // Spring to Home
+                    let tx = centerX + p.hx;
+                    let ty = centerY + p.hy;
+                    
+                    if(p.drip) {
+                        // Float animation for drips
+                        ty += Math.sin(Date.now() * 0.002 + i) * 30;
                     }
-                } catch (err) {
-                    logError("Error parsing OBJ: " + err.message);
+
+                    p.x += (tx - p.x) * (p.drip ? 0.01 : ELASTICITY);
+                    p.y += (ty - p.y) * (p.drip ? 0.01 : ELASTICITY);
                 }
-            };
-            reader.readAsText(file);
+            }
+
+            // Keep Blob Together (Constraints)
+            // We only constrain the first POINTS (the main blob), not the drips
+            for(let iter=0; iter<4; iter++) {
+                for(let i=0; i<POINTS; i++) {
+                    let p1 = points[i];
+                    let p2 = points[(i+1)%POINTS]; // Next point in ring
+
+                    let dx = p2.x - p1.x;
+                    let dy = p2.y - p1.y;
+                    let d = Math.hypot(dx, dy);
+                    let targetDist = 20; // Approx distance between points
+                    
+                    // Push/Pull to maintain distance
+                    let diff = (targetDist - d) / d * 0.5;
+                    let ox = dx * diff;
+                    let oy = dy * diff;
+
+                    if(p1 !== dragPoint) { p1.x -= ox; p1.y -= oy; }
+                    if(p2 !== dragPoint) { p2.x += ox; p2.y += oy; }
+                }
+            }
+        }
+
+        // --- RENDERING ---
+
+        // We need a flat array to send points to WebGL
+        const flatPoints = new Float32Array(TOTAL_POINTS * 2);
+
+        function draw() {
+            updatePhysics();
+
+            // 1. Draw WebGL Blob
+            gl.viewport(0, 0, width, height);
+            
+            // Update Uniforms
+            gl.uniform2f(resLoc, width, height);
+            gl.uniform1f(strLoc, currentStress);
+
+            // Update Point Data
+            for(let i=0; i<TOTAL_POINTS; i++) {
+                flatPoints[i*2]     = points[i].x;
+                flatPoints[i*2 + 1] = points[i].y;
+            }
+            gl.uniform2fv(ptsLoc, flatPoints);
+
+            // Draw Rect
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+
+            // 2. Draw 2D Face
+            uiCtx.clearRect(0, 0, width, height);
+            
+            // Calculate center for face
+            let avgX = 0, avgY = 0;
+            for(let i=0; i<POINTS; i++) { avgX += points[i].x; avgY += points[i].y; }
+            avgX /= POINTS; avgY /= POINTS;
+
+            const eyeOff = 60;
+            const eyeSize = 16 + (currentStress * 12);
+            const faceY = avgY - 30;
+
+            uiCtx.fillStyle = '#2D3436';
+            uiCtx.strokeStyle = '#2D3436';
+            uiCtx.lineWidth = 6;
+            uiCtx.lineCap = 'round';
+
+            // Logic for Face Expressions
+            if (wobbleTimer > 0) {
+                // Dizzy X Eyes
+                drawX(avgX - eyeOff, faceY);
+                drawX(avgX + eyeOff, faceY);
+                // Squiggle Mouth
+                uiCtx.beginPath();
+                uiCtx.moveTo(avgX - 25, faceY + 50);
+                uiCtx.bezierCurveTo(avgX, faceY+20, avgX, faceY+80, avgX + 25, faceY + 50);
+                uiCtx.stroke();
+            } else if (currentStress > 0.15) {
+                // Stressed Eyes
+                uiCtx.beginPath();
+                uiCtx.ellipse(avgX - eyeOff, faceY, eyeSize, eyeSize + currentStress*20, 0, 0, Math.PI*2);
+                uiCtx.ellipse(avgX + eyeOff, faceY, eyeSize, eyeSize + currentStress*20, 0, 0, Math.PI*2);
+                uiCtx.fill();
+                // O Mouth
+                uiCtx.beginPath();
+                uiCtx.arc(avgX, faceY + 50, 15 + currentStress*15, 0, Math.PI*2);
+                uiCtx.fill();
+            } else {
+                // Happy Eyes
+                uiCtx.beginPath();
+                uiCtx.arc(avgX - eyeOff, faceY, 16, 0, Math.PI*2);
+                uiCtx.arc(avgX + eyeOff, faceY, 16, 0, Math.PI*2);
+                uiCtx.fill();
+                // Smile
+                uiCtx.beginPath();
+                uiCtx.arc(avgX, faceY + 40, 25, 0, Math.PI, false);
+                uiCtx.fill();
+                // Tongue
+                uiCtx.fillStyle = '#FF6B6B';
+                uiCtx.beginPath();
+                uiCtx.arc(avgX, faceY + 52, 12, 0, Math.PI, false);
+                uiCtx.fill();
+            }
+
+            requestAnimationFrame(draw);
+        }
+
+        function drawX(x, y) {
+            const s = 14;
+            uiCtx.beginPath();
+            uiCtx.moveTo(x-s, y-s); uiCtx.lineTo(x+s, y+s);
+            uiCtx.moveTo(x+s, y-s); uiCtx.lineTo(x-s, y+s);
+            uiCtx.stroke();
+        }
+
+
+        // --- INPUT HANDLING ---
+
+        function handleStart(x, y) {
+            mouseX = x; mouseY = y;
+            let bestDist = 100; // Hitbox radius
+            
+            // Check all points
+            for(let p of points) {
+                const d = Math.hypot(p.x - x, p.y - y);
+                if(d < bestDist) {
+                    bestDist = d;
+                    dragPoint = p;
+                }
+            }
+            if(dragPoint) {
+                isDragging = true;
+                wobbleTimer = 0;
+            }
+        }
+
+        function handleEnd() {
+            // Trigger dizzy face if we snap back hard
+            if(dragPoint && !dragPoint.drip && currentStress > 0.2) {
+                wobbleTimer = 100; // Frames of dizziness
+            }
+            isDragging = false;
+            dragPoint = null;
+        }
+
+        // Mouse Events
+        window.addEventListener('mousedown', e => handleStart(e.clientX, e.clientY));
+        window.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+        window.addEventListener('mouseup', handleEnd);
+
+        // Touch Events (iPad Support)
+        window.addEventListener('touchstart', e => {
+            e.preventDefault();
+            handleStart(e.touches[0].clientX, e.touches[0].clientY);
+        }, {passive: false});
+
+        window.addEventListener('touchmove', e => {
+            e.preventDefault(); // Stop scrolling
+            mouseX = e.touches[0].clientX;
+            mouseY = e.touches[0].clientY;
+        }, {passive: false});
+
+        window.addEventListener('touchend', handleEnd);
+
+        // Resize
+        window.addEventListener('resize', () => {
+            glCanvas.width = window.innerWidth;
+            glCanvas.height = window.innerHeight;
+            uiCanvas.width = window.innerWidth;
+            uiCanvas.height = window.innerHeight;
+            initPoints();
         });
 
-        init();
+        // Start
+        window.dispatchEvent(new Event('resize'));
+        draw();
+
     </script>
 </body>
-
 </html>
