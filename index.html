@@ -1,122 +1,652 @@
 <!DOCTYPE html>
-<html>
-<body>
-    <canvas id="canvas" width="600" height="600"></canvas>
-    <script type="module">
-    async function init() {
-        if (!navigator.gpu) { alert("WebGPU not supported!"); return; }
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Giant Minty Blob (WebGPU Edition)</title>
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght=400;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../../style/pause.css">
+    <style>
+        :root {
+            --bg-cloud: #F0F4F8;
+            --color-mint: #6BCB77;
+            --color-red: #CD5C5C;
+            --text-dark: #2D3436;
+        }
 
-        const adapter = await navigator.gpu.requestAdapter();
-        const device = await adapter.requestDevice();
-        const canvas = document.getElementById("canvas");
-        const context = canvas.getContext("webgpu");
-        const format = navigator.gpu.getPreferredCanvasFormat();
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: var(--bg-cloud);
+            /* Radial gradient moved to CSS for static bg, shader handles dynamics */
+            background-image: radial-gradient(#DDE1E7 15%, transparent 16%);
+            background-size: 20px 20px;
+            font-family: 'Nunito', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        /* Container for the layers */
+        #game-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        /* Layer 1: WebGPU Canvas (Background Slime) */
+        canvas#gpuCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        /* Layer 2: 2D Canvas (Face & UI interactions) */
+        canvas#uiCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            cursor: grab;
+            touch-action: none;
+        }
+        canvas#uiCanvas:active {
+            cursor: grabbing;
+        }
+
+        /* Pause UI styling from original */
+        .game-pause-layer {
+            position: absolute;
+            z-index: 100;
+            top: 20px;
+            right: 20px;
+        }
         
-        context.configure({ device: device, format: format });
+        .pause-circle-btn {
+            background: white;
+            border: none;
+            width: 50px; height: 50px;
+            border-radius: 50%;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: transform 0.2s;
+        }
+        .pause-circle-btn:hover { transform: scale(1.1); }
+        .pause-circle-btn svg { width: 24px; height: 24px; stroke: #2D3436; stroke-width: 2; fill: #2D3436; }
 
-        // --- 1. THE PHYSICS DATA (CPU Side) ---
-        // Simple Physics State
-        let x = 0.0;
-        let y = 0.0;
-        let velocityX = 0.01;
-        let velocityY = 0.015;
+        #pause-menu-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(240, 244, 248, 0.9);
+            backdrop-filter: blur(5px);
+            z-index: 200;
+            display: flex; justify-content: center; align-items: center;
+            opacity: 1; transition: opacity 0.3s;
+        }
+        #pause-menu-overlay.hidden { opacity: 0; pointer-events: none; }
 
-        // We need a buffer to send these (x, y) numbers to the GPU
-        // 2 floats = 8 bytes
-        const uniformBuffer = device.createBuffer({
-            size: 8, 
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
+        .pause-card {
+            background: white; padding: 40px; border-radius: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .pause-action-btn {
+            display: block; width: 200px; padding: 15px; margin: 10px 0;
+            border-radius: 15px; border: none; font-weight: 800; font-size: 16px; cursor: pointer;
+        }
+        .btn-resume { background: var(--color-mint); color: white; }
+        .btn-exit { background: #eee; color: var(--text-dark); }
+        
+        /* Error message if WebGPU is missing */
+        #no-webgpu {
+            display: none;
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: white; padding: 20px; border-radius: 10px;
+            text-align: center; z-index: 999;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+    </style>
+</head>
+<body>
 
-        // --- 2. THE SHADER (GPU Side) ---
-        // We added a 'struct' to receive the position from JS
-        const shaderCode = `
-            struct Position {
-                offset: vec2f,
+    <div id="no-webgpu">
+        <h3>WebGPU Not Supported</h3>
+        <p>Please use a compatible browser (Chrome/Edge 113+).</p>
+    </div>
+
+    <div id="game-container">
+        <canvas id="gpuCanvas"></canvas>
+        <canvas id="uiCanvas"></canvas>
+    </div>
+
+    <div class="game-pause-layer">
+        <button id="pause-btn" class="pause-circle-btn" onclick="togglePauseMenu()">
+            <svg viewBox="0 0 24 24"><path d="M8 5V19M16 5V19" stroke="none" /><rect x="7" y="5" width="4" height="14" rx="1" /><rect x="13" y="5" width="4" height="14" rx="1" /></svg>
+        </button>
+    </div>
+
+    <div id="pause-menu-overlay" class="hidden">
+        <div class="pause-card">
+            <h2>PAUSED</h2>
+            <div class="pause-actions">
+                <button class="pause-action-btn btn-resume" onclick="togglePauseMenu()">Resume</button>
+                <button class="pause-action-btn btn-exit" onclick="location.reload()">Reset</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="../../../javascript/pause.js"></script>
+    <script>
+        // --- WEBGPU SHADER CODE (WGSL) ---
+        // This shader calculates the distance from every pixel to every point 
+        // and smooths them together to create the blob shape.
+        const slimeShaderCode = `
+            struct Uniforms {
+                resolution: vec2f,
+                blobColor: vec3f,
+                stressLevel: f32,
+                time: f32,
             };
-            
-            @group(0) @binding(0) var<uniform> player: Position;
+
+            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+            @group(0) @binding(1) var<storage, read> points: array<vec2f>;
+
+            struct VertexOutput {
+                @builtin(position) position: vec4f,
+                @location(0) uv: vec2f,
+            };
 
             @vertex
-            fn vs_main(@builtin(vertex_index) id : u32) -> @builtin(position) vec4f {
-                var pos = array<vec2f, 3>(
-                    vec2f( 0.0,  0.2),  // Top
-                    vec2f(-0.2, -0.2),  // Bottom Left
-                    vec2f( 0.2, -0.2)   // Bottom Right
+            fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+                var pos = array<vec2f, 6>(
+                    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                    vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0)
                 );
-                
-                // PHYSICS MAGIC: Add the offset to the original position
-                let newPos = pos[id] + player.offset;
-                
-                return vec4f(newPos, 0.0, 1.0);
+                var output: VertexOutput;
+                output.position = vec4f(pos[vertexIndex], 0.0, 1.0);
+                output.uv = pos[vertexIndex] * 0.5 + 0.5; // 0..1
+                output.uv.y = 1.0 - output.uv.y; // Flip Y for convenient coord system
+                return output;
+            }
+
+            // Smooth Minimum function (Polynomial) - The secret sauce for "Goo"
+            fn smin(a: f32, b: f32, k: f32) -> f32 {
+                let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+                return mix(b, a, h) - k * h * (1.0 - h);
             }
 
             @fragment
-            fn fs_main() -> @location(0) vec4f {
-                return vec4f(0.2, 0.8, 1.0, 1.0); // Cyan
+            fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+                let fragCoord = uv * uniforms.resolution;
+                
+                // 1. Calculate Signed Distance Field (SDF) to all points
+                var d: f32 = 10000.0;
+                let numPoints = arrayLength(&points);
+                
+                // Smoothing factor (Controls how "liquid" it looks)
+                let k = 60.0; 
+
+                for (var i: u32 = 0; i < numPoints; i++) {
+                    let p = points[i];
+                    let dist = distance(fragCoord, p);
+                    
+                    // Subtract radius to make points have volume
+                    // We vary radius slightly: first 60 are Main Blob, rest are Drips
+                    var radius = 25.0; // Connection radius
+                    if (i >= 60) { radius = 80.0; } // Drips are bigger
+
+                    d = smin(d, dist - radius, k);
+                }
+
+                // 2. Rendering / Thresholding
+                // Defines the edge of the slime
+                let edgeWidth = 3.0;
+                let alpha = 1.0 - smoothstep(0.0, edgeWidth, d);
+
+                if (alpha < 0.01) {
+                    discard;
+                }
+
+                // 3. Coloring
+                // Base Color
+                var color = uniforms.blobColor;
+
+                // Gradient/Lighting effect based on internal distance (pseudo-3D)
+                // d is negative inside the shape. The more negative, the "deeper" inside.
+                let depth = clamp(-d / 100.0, 0.0, 1.0);
+                color = mix(color * 0.9, color * 1.3, depth);
+
+                // Add Stress Red
+                let stressRed = vec3f(0.8, 0.2, 0.2);
+                color = mix(color, stressRed, uniforms.stressLevel * 0.8);
+
+                // Edge Outline (Darker Green)
+                let outline = smoothstep(-5.0, 0.0, d);
+                let outlineColor = uniforms.blobColor * 0.6;
+                color = mix(color, outlineColor, outline);
+
+                return vec4f(color, alpha);
             }
         `;
 
-        const module = device.createShaderModule({ code: shaderCode });
+        // --- GAME VARIABLES ---
+        const POINTS = 60;
+        const DRIP_COUNT = 6;
+        const TOTAL_POINTS = POINTS + DRIP_COUNT;
+        
+        // Physics vars
+        const HEAD_RADIUS = 160;
+        const VISCOSITY = 0.92;
+        const ELASTICITY = 0.05;
+        const PALETTE = { mint: [0.42, 0.796, 0.466] }; // RGB 0-1 for GPU
 
-        // --- 3. THE PIPELINE ---
-        const pipeline = device.createRenderPipeline({
-            layout: "auto",
-            vertex: { module: module, entryPoint: "vs_main" },
-            fragment: { module: module, entryPoint: "fs_main", targets: [{ format: format }] },
-            primitive: { topology: "triangle-list" },
-        });
+        let points = [];
+        let width, height;
+        let isDragging = false, dragPoint = null, mouseX = 0, mouseY = 0;
+        let currentStress = 0, wobbleTimer = 0;
+        let anchorX, anchorY;
 
-        // Create a "Bind Group" (This links the Buffer to the Shader)
-        const bindGroup = device.createBindGroup({
-            layout: pipeline.getBindGroupLayout(0),
-            entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
-        });
+        // WebGPU vars
+        let device, context, pipeline, bindGroup;
+        let uniformBuffer, pointBuffer;
+        let pointData = new Float32Array(TOTAL_POINTS * 2); // x,y for each point
 
-        // --- 4. THE GAME LOOP ---
-        function frame() {
-            // A. Update Physics (CPU)
-            x += velocityX;
-            y += velocityY;
+        // UI Canvas
+        const uiCanvas = document.getElementById('uiCanvas');
+        const uiCtx = uiCanvas.getContext('2d');
 
-            // Simple Collision Detection (Screen is -1.0 to 1.0)
-            // If we hit the wall, reverse velocity
-            if (x > 0.8 || x < -0.8) velocityX *= -1;
-            if (y > 0.8 || y < -0.8) velocityY *= -1;
+        // --- INITIALIZATION ---
 
-            // B. Send Data to GPU
-            const data = new Float32Array([x, y]);
-            device.queue.writeBuffer(uniformBuffer, 0, data);
+        async function initWebGPU() {
+            if (!navigator.gpu) {
+                document.getElementById('no-webgpu').style.display = 'block';
+                return false;
+            }
 
-            // C. Draw
-            const commandEncoder = device.createCommandEncoder();
-            const textureView = context.getCurrentTexture().createView();
+            const adapter = await navigator.gpu.requestAdapter();
+            device = await adapter.requestDevice();
+            const canvas = document.getElementById('gpuCanvas');
+            context = canvas.getContext('webgpu');
 
-            const passEncoder = commandEncoder.beginRenderPass({
-                colorAttachments: [{
-                    view: textureView,
-                    loadOp: "clear",
-                    clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
-                    storeOp: "store",
-                }],
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+            uiCanvas.width = width;
+            uiCanvas.height = height;
+
+            const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+            context.configure({
+                device: device,
+                format: presentationFormat,
+                alphaMode: 'premultiplied',
             });
 
+            // Shader Module
+            const module = device.createShaderModule({ label: 'slime shader', code: slimeShaderCode });
+
+            // Pipeline
+            pipeline = device.createRenderPipeline({
+                label: 'slime pipeline',
+                layout: 'auto',
+                vertex: { module, entryPoint: 'vs_main' },
+                fragment: {
+                    module,
+                    entryPoint: 'fs_main',
+                    targets: [{ format: presentationFormat }]
+                }
+            });
+
+            // Buffers
+            // 1. Uniforms: Resolution (2), Color (3), Stress(1), Time(1) + Padding
+            const uniformBufferSize = 32 + 16; // 48 bytes roughly needed, align to 16
+            uniformBuffer = device.createBuffer({
+                size: uniformBufferSize,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            // 2. Points Storage Buffer (read-only in shader, written from CPU)
+            pointBuffer = device.createBuffer({
+                size: pointData.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+
+            // Bind Groups
+            bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: uniformBuffer } },
+                    { binding: 1, resource: { buffer: pointBuffer } }
+                ]
+            });
+
+            initPhysics();
+            requestAnimationFrame(renderLoop);
+            return true;
+        }
+
+        function initPhysics() {
+            anchorX = width / 2;
+            anchorY = height / 2;
+            points = [];
+
+            // 1. Main Blob Points
+            for (let i = 0; i < POINTS; i++) {
+                const angle = (Math.PI * 2 * i) / POINTS;
+                let r = HEAD_RADIUS;
+                const sine = Math.sin(angle);
+                if (sine > 0) r += sine * (HEAD_RADIUS * 0.5) + Math.sin(angle * 5) * 15;
+
+                const startX = Math.cos(angle) * r;
+                const startY = Math.sin(angle) * r * 0.9;
+                
+                points.push({
+                    x: anchorX + startX, y: anchorY + startY,
+                    oldx: anchorX + startX, oldy: anchorY + startY,
+                    homeX: startX, homeY: startY,
+                    nextRestDist: 0,
+                    isDrip: false
+                });
+            }
+
+            // Calculate rest distances
+            for (let i = 0; i < POINTS; i++) {
+                let p1 = points[i];
+                let p2 = points[(i + 1) % POINTS];
+                p1.nextRestDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+            }
+
+            // 2. Background Drips (Physics Objects)
+            for(let i=0; i<DRIP_COUNT; i++) {
+                // Random edge spawn
+                const edge = i % 4;
+                let hx, hy;
+                const m = 100; // margin
+                if(edge === 0) { hx = rand(-width/2, width/2); hy = -height/2 - 100; } // Top
+                else if(edge === 1) { hx = width/2 + 100; hy = rand(-height/2, height/2); } // Right
+                else if(edge === 2) { hx = rand(-width/2, width/2); hy = height/2 + 100; } // Bottom
+                else { hx = -width/2 - 100; hy = rand(-height/2, height/2); } // Left
+
+                points.push({
+                    x: anchorX + hx, y: anchorY + hy,
+                    oldx: anchorX + hx, oldy: anchorY + hy,
+                    homeX: hx, homeY: hy,
+                    isDrip: true
+                });
+            }
+        }
+
+        function rand(min, max) { return Math.random() * (max - min) + min; }
+
+        // --- UPDATE LOOP ---
+
+        function updatePhysics() {
+            if (wobbleTimer > 0) wobbleTimer--;
+
+            // Main Blob Center Calculation for Stress
+            let avgX = 0, avgY = 0;
+            for(let i=0; i<POINTS; i++) { avgX += points[i].x; avgY += points[i].y; }
+            avgX /= POINTS; avgY /= POINTS;
+
+            // Stress Calc
+            if (isDragging && dragPoint && !dragPoint.isDrip) {
+                let dist = Math.hypot(dragPoint.x - avgX, dragPoint.y - avgY);
+                let base = Math.max(HEAD_RADIUS, Math.hypot(dragPoint.homeX, dragPoint.homeY));
+                currentStress = Math.max(0, Math.min(1, (dist - base) / 100));
+            } else if (!isDragging) {
+                currentStress *= 0.95; // Decay
+            }
+
+            // Update all points
+            for (let i = 0; i < points.length; i++) {
+                let p = points[i];
+
+                if (p === dragPoint) {
+                    p.x = mouseX;
+                    p.y = mouseY;
+                    p.oldx = p.x; p.oldy = p.y;
+                } else {
+                    // Verlet Integration
+                    const vx = (p.x - p.oldx) * VISCOSITY;
+                    const vy = (p.y - p.oldy) * VISCOSITY;
+                    p.oldx = p.x;
+                    p.oldy = p.y;
+                    p.x += vx;
+                    p.y += vy;
+
+                    // Return to Home Force
+                    let tx = anchorX + p.homeX;
+                    let ty = anchorY + p.homeY;
+                    
+                    // Add "breathing" noise to drips
+                    if(p.isDrip) {
+                        tx += Math.sin(Date.now()*0.002 + i)*30;
+                        ty += Math.cos(Date.now()*0.003 + i)*30;
+                    }
+
+                    let dx = tx - p.x;
+                    let dy = ty - p.y;
+                    let strength = p.isDrip ? 0.02 : ELASTICITY;
+                    if(isDragging) strength *= 0.5;
+
+                    p.x += dx * strength;
+                    p.y += dy * strength;
+                }
+
+                // Update GPU Array
+                pointData[i*2] = p.x;
+                pointData[i*2+1] = p.y;
+            }
+
+            // Constraints (Main Blob Only)
+            for(let iter=0; iter<4; iter++) {
+                for(let i=0; i<POINTS; i++) {
+                    let p1 = points[i];
+                    let p2 = points[(i+1)%POINTS];
+                    let dx = p2.x - p1.x;
+                    let dy = p2.y - p1.y;
+                    let dist = Math.hypot(dx, dy);
+                    let diff = p1.nextRestDist - dist;
+                    let percent = diff/dist/2;
+                    let ox = dx*percent*0.9;
+                    let oy = dy*percent*0.9;
+                    
+                    if(p1 !== dragPoint) { p1.x -= ox; p1.y -= oy; }
+                    if(p2 !== dragPoint) { p2.x += ox; p2.y += oy; }
+                }
+            }
+        }
+
+        function drawUI() {
+            uiCtx.clearRect(0, 0, width, height);
+
+            // Calculate Center
+            let avgX = 0, avgY = 0;
+            for(let i=0; i<POINTS; i++) { avgX += points[i].x; avgY += points[i].y; }
+            avgX /= POINTS; avgY /= POINTS;
+
+            // Draw Face
+            const eyeOffset = 60;
+            const eyeSize = 16 + (currentStress * 10);
+            
+            uiCtx.fillStyle = '#2D3436';
+            uiCtx.strokeStyle = '#2D3436';
+            uiCtx.lineWidth = 6;
+            uiCtx.lineCap = 'round';
+
+            let faceY = avgY - 30;
+
+            if (wobbleTimer > 0) {
+                // Dizzy X Eyes
+                drawX(avgX - eyeOffset, faceY);
+                drawX(avgX + eyeOffset, faceY);
+                
+                // Wavy mouth
+                uiCtx.beginPath();
+                uiCtx.moveTo(avgX - 20, faceY + 50);
+                uiCtx.bezierCurveTo(avgX-10, faceY+30, avgX+10, faceY+70, avgX+20, faceY+50);
+                uiCtx.stroke();
+            } else if (currentStress > 0.15) {
+                // Stressed Eyes (Elongated)
+                uiCtx.beginPath();
+                uiCtx.ellipse(avgX - eyeOffset, faceY, eyeSize, eyeSize + currentStress*20, 0, 0, Math.PI*2);
+                uiCtx.ellipse(avgX + eyeOffset, faceY, eyeSize, eyeSize + currentStress*20, 0, 0, Math.PI*2);
+                uiCtx.fill();
+                
+                // O Mouth
+                uiCtx.beginPath();
+                uiCtx.arc(avgX, faceY + 50, 10 + (currentStress*10), 0, Math.PI*2);
+                uiCtx.fill();
+            } else {
+                // Happy Eyes
+                uiCtx.beginPath();
+                uiCtx.arc(avgX - eyeOffset, faceY, eyeSize, 0, Math.PI*2);
+                uiCtx.arc(avgX + eyeOffset, faceY, eyeSize, 0, Math.PI*2);
+                uiCtx.fill();
+
+                // Smile
+                uiCtx.beginPath();
+                uiCtx.arc(avgX, faceY + 40, 25, 0, Math.PI, false);
+                uiCtx.fill();
+                // Tongue
+                uiCtx.fillStyle = '#FF6B6B';
+                uiCtx.beginPath();
+                uiCtx.arc(avgX, faceY + 52, 12, 0, Math.PI, false);
+                uiCtx.fill();
+            }
+        }
+
+        function drawX(x, y) {
+            const s = 15;
+            uiCtx.beginPath();
+            uiCtx.moveTo(x-s, y-s); uiCtx.lineTo(x+s, y+s);
+            uiCtx.moveTo(x+s, y-s); uiCtx.lineTo(x-s, y+s);
+            uiCtx.stroke();
+        }
+
+        function renderLoop() {
+            if(window.isPaused) {
+                requestAnimationFrame(renderLoop);
+                return;
+            }
+
+            updatePhysics();
+            drawUI();
+
+            // --- WEBGPU RENDER PASS ---
+            
+            // 1. Write Points to GPU Buffer
+            device.queue.writeBuffer(pointBuffer, 0, pointData);
+
+            // 2. Write Uniforms
+            const uniformData = new Float32Array([
+                width, height,             // Resolution
+                PALETTE.mint[0], PALETTE.mint[1], PALETTE.mint[2], // Color
+                currentStress,             // Stress
+                performance.now() / 1000,  // Time
+                0 // Padding
+            ]);
+            device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+            // 3. Command Encoder
+            const commandEncoder = device.createCommandEncoder();
+            const textureView = context.getCurrentTexture().createView();
+            
+            const renderPassDescriptor = {
+                colorAttachments: [{
+                    view: textureView,
+                    clearValue: { r: 0, g: 0, b: 0, a: 0 }, // Transparent background
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                }],
+            };
+
+            const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
             passEncoder.setPipeline(pipeline);
-            passEncoder.setBindGroup(0, bindGroup); // Tell GPU to use our updated numbers
-            passEncoder.draw(3);
+            passEncoder.setBindGroup(0, bindGroup);
+            passEncoder.draw(6); // Draw 6 vertices (Full screen quad)
             passEncoder.end();
 
             device.queue.submit([commandEncoder.finish()]);
-            
-            // Loop forever
-            requestAnimationFrame(frame);
+
+            requestAnimationFrame(renderLoop);
         }
 
-        // Start the engine
-        requestAnimationFrame(frame);
-    }
+        // --- INPUT HANDLING ---
+        function handleStart(x, y) {
+            mouseX = x; mouseY = y;
+            let bestDist = 1000;
+            let bestP = null;
+            
+            // Check all points (blob + drips)
+            for(let p of points) {
+                let dist = Math.hypot(p.x - x, p.y - y);
+                if(dist < bestDist && dist < 100) {
+                    bestDist = dist;
+                    bestP = p;
+                }
+            }
+            if(bestP) {
+                isDragging = true;
+                dragPoint = bestP;
+                wobbleTimer = 0;
+            }
+        }
 
-    init();
-</script>
+        window.addEventListener('mousedown', e => handleStart(e.clientX, e.clientY));
+        window.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+        window.addEventListener('mouseup', () => {
+            if(dragPoint && !dragPoint.isDrip && currentStress > 0.15) wobbleTimer = 120;
+            isDragging = false; dragPoint = null;
+        });
+        
+        // Touch support
+        window.addEventListener('touchstart', e => { e.preventDefault(); handleStart(e.touches[0].clientX, e.touches[0].clientY); }, {passive:false});
+        window.addEventListener('touchmove', e => { e.preventDefault(); mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }, {passive:false});
+        window.addEventListener('touchend', () => { 
+            if(dragPoint && !dragPoint.isDrip && currentStress > 0.15) wobbleTimer = 120;
+            isDragging = false; dragPoint = null; 
+        });
+
+        // Resize
+        window.addEventListener('resize', () => {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            document.getElementById('gpuCanvas').width = width;
+            document.getElementById('gpuCanvas').height = height;
+            uiCanvas.width = width;
+            uiCanvas.height = height;
+            // Re-init physics anchors
+            let dx = width/2 - anchorX;
+            let dy = height/2 - anchorY;
+            anchorX = width/2; anchorY = height/2;
+            points.forEach(p => { p.x+=dx; p.y+=dy; p.oldx+=dx; p.oldy+=dy; });
+        });
+
+        // Pause Toggle (Global var used by pause.js)
+        window.isPaused = false;
+        function togglePauseMenu() {
+            window.isPaused = !window.isPaused;
+            const overlay = document.getElementById('pause-menu-overlay');
+            if(window.isPaused) overlay.classList.remove('hidden');
+            else {
+                overlay.classList.add('hidden');
+                requestAnimationFrame(renderLoop);
+            }
+        }
+
+        // Start
+        initWebGPU();
+
+    </script>
 </body>
 </html>
