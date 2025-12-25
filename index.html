@@ -1,649 +1,462 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Giant Minty Blob (WebGPU Edition)</title>
-    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght=400;700;800;900&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="../../../style/pause.css">
-    <style>
-        :root {
-            --bg-cloud: #F0F4F8;
-            --color-mint: #6BCB77;
-            --color-red: #CD5C5C;
-            --text-dark: #2D3436;
-        }
+<html>
 
+<head>
+    <title>WebGPU 3D OBJ Viewer</title>
+    <style>
         body {
-            margin: 0;
-            overflow: hidden;
-            background-color: var(--bg-cloud);
-            /* Radial gradient moved to CSS for static bg, shader handles dynamics */
-            background-image: radial-gradient(#DDE1E7 15%, transparent 16%);
-            background-size: 20px 20px;
-            font-family: 'Nunito', sans-serif;
+            background: #111;
+            color: white;
             display: flex;
-            justify-content: center;
+            flex-direction: column;
             align-items: center;
             height: 100vh;
-            user-select: none;
-            -webkit-user-select: none;
+            margin: 0;
+            font-family: system-ui, sans-serif;
+            overflow: hidden; /* Prevent scrollbars during resize */
         }
 
-        /* Container for the layers */
-        #game-container {
-            position: relative;
-            width: 100vw;
-            height: 100vh;
+        canvas {
+            border: 1px solid #333;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+            margin-bottom: 20px;
+            display: block;
         }
 
-        /* Layer 1: WebGPU Canvas (Background Slime) */
-        canvas#gpuCanvas {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 1;
-        }
-
-        /* Layer 2: 2D Canvas (Face & UI interactions) */
-        canvas#uiCanvas {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 2;
-            cursor: grab;
-            touch-action: none;
-        }
-        canvas#uiCanvas:active {
-            cursor: grabbing;
-        }
-
-        /* Pause UI styling from original */
-        .game-pause-layer {
-            position: absolute;
-            z-index: 100;
-            top: 20px;
-            right: 20px;
-        }
-        
-        .pause-circle-btn {
-            background: white;
-            border: none;
-            width: 50px; height: 50px;
-            border-radius: 50%;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
-            cursor: pointer;
-            display: flex; align-items: center; justify-content: center;
-            transition: transform 0.2s;
-        }
-        .pause-circle-btn:hover { transform: scale(1.1); }
-        .pause-circle-btn svg { width: 24px; height: 24px; stroke: #2D3436; stroke-width: 2; fill: #2D3436; }
-
-        #pause-menu-overlay {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(240, 244, 248, 0.9);
-            backdrop-filter: blur(5px);
-            z-index: 200;
-            display: flex; justify-content: center; align-items: center;
-            opacity: 1; transition: opacity 0.3s;
-        }
-        #pause-menu-overlay.hidden { opacity: 0; pointer-events: none; }
-
-        .pause-card {
-            background: white; padding: 40px; border-radius: 30px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        #controls {
+            background: #222;
+            padding: 20px;
+            border-radius: 8px;
             text-align: center;
+            z-index: 10;
         }
-        .pause-action-btn {
-            display: block; width: 200px; padding: 15px; margin: 10px 0;
-            border-radius: 15px; border: none; font-weight: 800; font-size: 16px; cursor: pointer;
-        }
-        .btn-resume { background: var(--color-mint); color: white; }
-        .btn-exit { background: #eee; color: var(--text-dark); }
-        
-        /* Error message if WebGPU is missing */
-        #no-webgpu {
+
+        #error-log {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            color: #ff5555;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 15px;
+            border-radius: 4px;
             display: none;
-            position: absolute; top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
-            background: white; padding: 20px; border-radius: 10px;
-            text-align: center; z-index: 999;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            max-width: 400px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            z-index: 100;
         }
     </style>
 </head>
+
 <body>
+    <div id="error-log"></div>
+    <canvas id="canvas" width="800" height="600"></canvas>
 
-    <div id="no-webgpu">
-        <h3>WebGPU Not Supported</h3>
-        <p>Please use a compatible browser (Chrome/Edge 113+).</p>
+    <div id="controls">
+        <h3>Upload .OBJ File</h3>
+        <input type="file" id="model-input" accept=".obj">
+        <p style="font-size: 0.8rem; color: #888;">Supports: v, f (auto-triangulates)</p>
     </div>
 
-    <div id="game-container">
-        <canvas id="gpuCanvas"></canvas>
-        <canvas id="uiCanvas"></canvas>
-    </div>
+    <script type="module">
+        // --- MATRIX MATH HELPERS (Column-Major for WebGPU) ---
+        const mat4 = {
+            perspective: (fovy, aspect, near, far) => {
+                const f = 1.0 / Math.tan(fovy / 2);
+                const out = new Float32Array(16);
+                out[0] = f / aspect;
+                out[5] = f;
+                out[10] = (far + near) / (near - far); // Z normalization for WebGPU (0 to 1) often different than GL (-1 to 1)
+                // WebGPU clip space Z is 0..1. The standard GL projection puts Z in -1..1.
+                // For WebGPU specifically:
+                out[10] = far / (near - far);
+                out[11] = -1;
+                out[14] = (near * far) / (near - far);
+                return out;
+            },
+            multiply: (a, b) => {
+                // strict column-major multiplication
+                const out = new Float32Array(16);
+                const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3];
+                const a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
+                const a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11];
+                const a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
 
-    <div class="game-pause-layer">
-        <button id="pause-btn" class="pause-circle-btn" onclick="togglePauseMenu()">
-            <svg viewBox="0 0 24 24"><path d="M8 5V19M16 5V19" stroke="none" /><rect x="7" y="5" width="4" height="14" rx="1" /><rect x="13" y="5" width="4" height="14" rx="1" /></svg>
-        </button>
-    </div>
+                let b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+                out[0] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+                out[1] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+                out[2] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+                out[3] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
 
-    <div id="pause-menu-overlay" class="hidden">
-        <div class="pause-card">
-            <h2>PAUSED</h2>
-            <div class="pause-actions">
-                <button class="pause-action-btn btn-resume" onclick="togglePauseMenu()">Resume</button>
-                <button class="pause-action-btn btn-exit" onclick="location.reload()">Reset</button>
-            </div>
-        </div>
-    </div>
+                b0 = b[4]; b1 = b[5]; b2 = b[6]; b3 = b[7];
+                out[4] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+                out[5] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+                out[6] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+                out[7] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
 
-    <script src="../../../javascript/pause.js"></script>
-    <script>
-        // --- WEBGPU SHADER CODE (WGSL) ---
-        // This shader calculates the distance from every pixel to every point 
-        // and smooths them together to create the blob shape.
-        const slimeShaderCode = `
-            struct Uniforms {
-                resolution: vec2f,
-                blobColor: vec3f,
-                stressLevel: f32,
-                time: f32,
-            };
+                b0 = b[8]; b1 = b[9]; b2 = b[10]; b3 = b[11];
+                out[8] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+                out[9] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+                out[10] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+                out[11] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
 
-            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-            @group(0) @binding(1) var<storage, read> points: array<vec2f>;
+                b0 = b[12]; b1 = b[13]; b2 = b[14]; b3 = b[15];
+                out[12] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+                out[13] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+                out[14] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+                out[15] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+                return out;
+            },
+            rotateY: (angle) => {
+                const c = Math.cos(angle), s = Math.sin(angle);
+                // Column-major layout
+                return new Float32Array([
+                    c, 0, -s, 0,
+                    0, 1, 0, 0,
+                    s, 0, c, 0,
+                    0, 0, 0, 1
+                ]);
+            },
+            rotateX: (angle) => {
+                const c = Math.cos(angle), s = Math.sin(angle);
+                return new Float32Array([
+                    1, 0, 0, 0,
+                    0, c, s, 0,
+                    0, -s, c, 0,
+                    0, 0, 0, 1
+                ]);
+            },
+            translation: (x, y, z) => {
+                return new Float32Array([
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 1, 0,
+                    x, y, z, 1
+                ]);
+            }
+        };
 
-            struct VertexOutput {
-                @builtin(position) position: vec4f,
-                @location(0) uv: vec2f,
-            };
+        // --- ERROR LOGGING ---
+        function logError(msg) {
+            const el = document.getElementById("error-log");
+            el.innerText += msg + "\n";
+            el.style.display = "block";
+            console.error(msg);
+        }
 
-            @vertex
-            fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
-                var pos = array<vec2f, 6>(
-                    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
-                    vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0)
-                );
-                var output: VertexOutput;
-                output.position = vec4f(pos[vertexIndex], 0.0, 1.0);
-                output.uv = pos[vertexIndex] * 0.5 + 0.5; // 0..1
-                output.uv.y = 1.0 - output.uv.y; // Flip Y for convenient coord system
-                return output;
+        // --- MESH NORMALIZATION ---
+        function normalizeMesh(vertices) {
+            let minX = Infinity, minY = Infinity, minZ = Infinity;
+            let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+            // Stride is 6 (x,y,z, r,g,b)
+            for (let i = 0; i < vertices.length; i += 6) {
+                const x = vertices[i], y = vertices[i + 1], z = vertices[i + 2];
+                if (x < minX) minX = x;
+                if (y < minY) minY = y;
+                if (z < minZ) minZ = z;
+                if (x > maxX) maxX = x;
+                if (y > maxY) maxY = y;
+                if (z > maxZ) maxZ = z;
             }
 
-            // Smooth Minimum function (Polynomial) - The secret sauce for "Goo"
-            fn smin(a: f32, b: f32, k: f32) -> f32 {
-                let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-                return mix(b, a, h) - k * h * (1.0 - h);
+            const sizeX = maxX - minX, sizeY = maxY - minY, sizeZ = maxZ - minZ;
+            const maxDim = Math.max(sizeX, sizeY, sizeZ) || 1.0;
+            const scale = 2.0 / maxDim; // Scale to fit in 2x2x2 box
+
+            const centerX = (minX + maxX) / 2;
+            const centerY = (minY + maxY) / 2;
+            const centerZ = (minZ + maxZ) / 2;
+
+            for (let i = 0; i < vertices.length; i += 6) {
+                vertices[i] = (vertices[i] - centerX) * scale;
+                vertices[i + 1] = (vertices[i + 1] - centerY) * scale;
+                vertices[i + 2] = (vertices[i + 2] - centerZ) * scale;
             }
+            return vertices;
+        }
 
-            @fragment
-            fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
-                let fragCoord = uv * uniforms.resolution;
-                
-                // 1. Calculate Signed Distance Field (SDF) to all points
-                var d: f32 = 10000.0;
-                let numPoints = arrayLength(&points);
-                
-                // Smoothing factor (Controls how "liquid" it looks)
-                let k = 60.0; 
+        // --- OBJ PARSER ---
+        function parseOBJ(text) {
+            const positions = [];
+            const vertices = [];
 
-                for (var i: u32 = 0; i < numPoints; i++) {
-                    let p = points[i];
-                    let dist = distance(fragCoord, p);
-                    
-                    // Subtract radius to make points have volume
-                    // We vary radius slightly: first 60 are Main Blob, rest are Drips
-                    var radius = 25.0; // Connection radius
-                    if (i >= 60) { radius = 80.0; } // Drips are bigger
+            const lines = text.split('\n');
+            for (let line of lines) {
+                line = line.trim();
+                if (!line || line.startsWith('#')) continue;
 
-                    d = smin(d, dist - radius, k);
+                // Robust splitting by whitespace
+                const parts = line.split(/\s+/);
+                const type = parts[0];
+
+                if (type === 'v') {
+                    // v x y z
+                    positions.push([
+                        parseFloat(parts[1]), 
+                        parseFloat(parts[2]), 
+                        parseFloat(parts[3])
+                    ]);
+                } else if (type === 'f') {
+                    // f v1/vt1/vn1 v2/...
+                    const faceIndices = parts.slice(1);
+                    // Triangulate fan (assumes convex polygon)
+                    for (let i = 1; i < faceIndices.length - 1; i++) {
+                        const idx0 = parseInt(faceIndices[0].split('/')[0]) - 1;
+                        const idx1 = parseInt(faceIndices[i].split('/')[0]) - 1;
+                        const idx2 = parseInt(faceIndices[i + 1].split('/')[0]) - 1;
+
+                        [idx0, idx1, idx2].forEach(idx => {
+                            if (!positions[idx]) return;
+                            const p = positions[idx];
+                            // x, y, z
+                            vertices.push(p[0], p[1], p[2]);
+                            
+                            // Generate a pleasing Color based on normals or positions
+                            // Using position-based coloring for simplicity
+                            vertices.push(
+                                0.5 + p[0] * 0.5, 
+                                0.5 + p[1] * 0.5, 
+                                0.5 + p[2] * 0.5
+                            );
+                        });
+                    }
                 }
-
-                // 2. Rendering / Thresholding
-                // Defines the edge of the slime
-                let edgeWidth = 3.0;
-                let alpha = 1.0 - smoothstep(0.0, edgeWidth, d);
-
-                if (alpha < 0.01) {
-                    discard;
-                }
-
-                // 3. Coloring
-                // Base Color
-                var color = uniforms.blobColor;
-
-                // Gradient/Lighting effect based on internal distance (pseudo-3D)
-                // d is negative inside the shape. The more negative, the "deeper" inside.
-                let depth = clamp(-d / 100.0, 0.0, 1.0);
-                color = mix(color * 0.9, color * 1.3, depth);
-
-                // Add Stress Red
-                let stressRed = vec3f(0.8, 0.2, 0.2);
-                color = mix(color, stressRed, uniforms.stressLevel * 0.8);
-
-                // Edge Outline (Darker Green)
-                let outline = smoothstep(-5.0, 0.0, d);
-                let outlineColor = uniforms.blobColor * 0.6;
-                color = mix(color, outlineColor, outline);
-
-                return vec4f(color, alpha);
             }
-        `;
+            return normalizeMesh(new Float32Array(vertices));
+        }
 
-        // --- GAME VARIABLES ---
-        const POINTS = 60;
-        const DRIP_COUNT = 6;
-        const TOTAL_POINTS = POINTS + DRIP_COUNT;
-        
-        // Physics vars
-        const HEAD_RADIUS = 160;
-        const VISCOSITY = 0.92;
-        const ELASTICITY = 0.05;
-        const PALETTE = { mint: [0.42, 0.796, 0.466] }; // RGB 0-1 for GPU
+        // --- GLOBAL STATE ---
+        let device, context, pipeline, uniformBindGroup, uniformBuffer, depthTexture, format;
+        let vertexBuffer;
+        let vertexCount = 0;
+        const canvas = document.getElementById("canvas");
 
-        let points = [];
-        let width, height;
-        let isDragging = false, dragPoint = null, mouseX = 0, mouseY = 0;
-        let currentStress = 0, wobbleTimer = 0;
-        let anchorX, anchorY;
+        async function init() {
+            try {
+                if (!navigator.gpu) throw new Error("WebGPU not supported in this browser.");
 
-        // WebGPU vars
-        let device, context, pipeline, bindGroup;
-        let uniformBuffer, pointBuffer;
-        let pointData = new Float32Array(TOTAL_POINTS * 2); // x,y for each point
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) throw new Error("No GPU adapter found!");
 
-        // UI Canvas
-        const uiCanvas = document.getElementById('uiCanvas');
-        const uiCtx = uiCanvas.getContext('2d');
+                device = await adapter.requestDevice();
+                device.lost.then((info) => logError(`Device lost: ${info.message}`));
 
-        // --- INITIALIZATION ---
+                context = canvas.getContext("webgpu");
+                format = navigator.gpu.getPreferredCanvasFormat();
+                context.configure({ device, format, alphaMode: 'premultiplied' });
 
-        async function initWebGPU() {
+                // Start with a Cube
+                const defaultCube = `
+v -1.0 -1.0  1.0
+v  1.0 -1.0  1.0
+v  1.0  1.0  1.0
+v -1.0  1.0  1.0
+v -1.0 -1.0 -1.0
+v -1.0  1.0 -1.0
+v  1.0  1.0 -1.0
+v  1.0 -1.0 -1.0
+f 1 2 3 4
+f 5 6 7 8
+f 1 5 8 2
+f 2 8 7 3
+f 3 7 6 4
+f 5 1 4 6
+                `;
+                loadMesh(parseOBJ(defaultCube));
 
+                setupPipeline();
+                
+                // Handle Window Resizing
+                window.addEventListener('resize', onResize);
+                onResize(); // Set initial size
 
-            const adapter = await navigator.gpu.requestAdapter();
-            device = await adapter.requestDevice();
-            const canvas = document.getElementById('gpuCanvas');
-            context = canvas.getContext('webgpu');
+                requestAnimationFrame(frame);
 
-            width = window.innerWidth;
-            height = window.innerHeight;
+            } catch (e) {
+                logError(e.message);
+            }
+        }
+
+        function onResize() {
+            // Resize canvas to display size for sharp rendering
+            const width = Math.min(window.innerWidth * 0.9, 1024);
+            const height = Math.min(window.innerHeight * 0.7, 768);
+            
             canvas.width = width;
             canvas.height = height;
-            uiCanvas.width = width;
-            uiCanvas.height = height;
 
-            const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
-            context.configure({
-                device: device,
-                format: presentationFormat,
-                alphaMode: 'premultiplied',
+            // Recreate Depth Texture to match new size
+            if (device) {
+                if (depthTexture) depthTexture.destroy();
+                depthTexture = device.createTexture({
+                    size: [canvas.width, canvas.height],
+                    format: 'depth24plus',
+                    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+                });
+            }
+        }
+
+        function loadMesh(data) {
+            if (data.length === 0) {
+                logError("Mesh has 0 vertices.");
+                return;
+            }
+            vertexCount = data.length / 6;
+
+            // Cleanup old buffer
+            if (vertexBuffer) vertexBuffer.destroy();
+
+            vertexBuffer = device.createBuffer({
+                size: data.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             });
+            device.queue.writeBuffer(vertexBuffer, 0, data);
+            console.log(`Mesh loaded: ${vertexCount} vertices`);
+        }
 
-            // Shader Module
-            const module = device.createShaderModule({ label: 'slime shader', code: slimeShaderCode });
-
-            // Pipeline
-            pipeline = device.createRenderPipeline({
-                label: 'slime pipeline',
-                layout: 'auto',
-                vertex: { module, entryPoint: 'vs_main' },
-                fragment: {
-                    module,
-                    entryPoint: 'fs_main',
-                    targets: [{ format: presentationFormat }]
-                }
-            });
-
-            // Buffers
-            // 1. Uniforms: Resolution (2), Color (3), Stress(1), Time(1) + Padding
-            const uniformBufferSize = 32 + 16; // 48 bytes roughly needed, align to 16
+        function setupPipeline() {
             uniformBuffer = device.createBuffer({
-                size: uniformBufferSize,
+                size: 64, // 4x4 matrix
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
 
-            // 2. Points Storage Buffer (read-only in shader, written from CPU)
-            pointBuffer = device.createBuffer({
-                size: pointData.byteLength,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            const shaderCode = `
+                struct Uniforms {
+                    modelViewProjectionMatrix : mat4x4<f32>,
+                }
+                @binding(0) @group(0) var<uniform> uniforms : Uniforms;
+
+                struct VertexOutput {
+                    @builtin(position) Position : vec4<f32>,
+                    @location(0) color : vec4<f32>,
+                }
+
+                @vertex
+                fn vs_main(@location(0) position : vec3<f32>, @location(1) color : vec3<f32>) -> VertexOutput {
+                    var output : VertexOutput;
+                    output.Position = uniforms.modelViewProjectionMatrix * vec4<f32>(position, 1.0);
+                    output.color = vec4<f32>(color, 1.0);
+                    return output;
+                }
+
+                @fragment
+                fn fs_main(@location(0) color : vec4<f32>) -> @location(0) vec4<f32> {
+                    return color;
+                }
+            `;
+
+            const module = device.createShaderModule({ code: shaderCode });
+
+            pipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: {
+                    module: module,
+                    entryPoint: 'vs_main',
+                    buffers: [{
+                        arrayStride: 24, // 3*4 + 3*4
+                        attributes: [
+                            { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
+                            { shaderLocation: 1, offset: 12, format: 'float32x3' } // color
+                        ]
+                    }]
+                },
+                fragment: {
+                    module: module,
+                    entryPoint: 'fs_main',
+                    targets: [{ format: format }]
+                },
+                primitive: {
+                    topology: 'triangle-list',
+                    cullMode: 'none', 
+                },
+                depthStencil: {
+                    depthWriteEnabled: true,
+                    depthCompare: 'less',
+                    format: 'depth24plus',
+                }
             });
 
-            // Bind Groups
-            bindGroup = device.createBindGroup({
+            uniformBindGroup = device.createBindGroup({
                 layout: pipeline.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: uniformBuffer } },
-                    { binding: 1, resource: { buffer: pointBuffer } }
-                ]
+                entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
             });
-
-            initPhysics();
-            requestAnimationFrame(renderLoop);
-            return true;
         }
 
-        function initPhysics() {
-            anchorX = width / 2;
-            anchorY = height / 2;
-            points = [];
+        function frame() {
+            if (!device || !pipeline || !depthTexture) return;
+            const now = Date.now() / 1000;
 
-            // 1. Main Blob Points
-            for (let i = 0; i < POINTS; i++) {
-                const angle = (Math.PI * 2 * i) / POINTS;
-                let r = HEAD_RADIUS;
-                const sine = Math.sin(angle);
-                if (sine > 0) r += sine * (HEAD_RADIUS * 0.5) + Math.sin(angle * 5) * 15;
+            const aspect = canvas.width / canvas.height;
+            const projectionMatrix = mat4.perspective(Math.PI / 4, aspect, 0.1, 100.0);
 
-                const startX = Math.cos(angle) * r;
-                const startY = Math.sin(angle) * r * 0.9;
-                
-                points.push({
-                    x: anchorX + startX, y: anchorY + startY,
-                    oldx: anchorX + startX, oldy: anchorY + startY,
-                    homeX: startX, homeY: startY,
-                    nextRestDist: 0,
-                    isDrip: false
-                });
-            }
+            // Camera View: move back 3 units
+            const viewMatrix = mat4.translation(0, 0, -3.5);
 
-            // Calculate rest distances
-            for (let i = 0; i < POINTS; i++) {
-                let p1 = points[i];
-                let p2 = points[(i + 1) % POINTS];
-                p1.nextRestDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-            }
+            // Rotate Model
+            const rotationX = mat4.rotateX(now * 0.5);
+            const rotationY = mat4.rotateY(now * 0.8);
+            const modelMatrix = mat4.multiply(rotationX, rotationY);
 
-            // 2. Background Drips (Physics Objects)
-            for(let i=0; i<DRIP_COUNT; i++) {
-                // Random edge spawn
-                const edge = i % 4;
-                let hx, hy;
-                const m = 100; // margin
-                if(edge === 0) { hx = rand(-width/2, width/2); hy = -height/2 - 100; } // Top
-                else if(edge === 1) { hx = width/2 + 100; hy = rand(-height/2, height/2); } // Right
-                else if(edge === 2) { hx = rand(-width/2, width/2); hy = height/2 + 100; } // Bottom
-                else { hx = -width/2 - 100; hy = rand(-height/2, height/2); } // Left
+            // Combine: MVP = Projection * View * Model
+            const modelView = mat4.multiply(viewMatrix, modelMatrix);
+            const modelViewProjection = mat4.multiply(projectionMatrix, modelView);
 
-                points.push({
-                    x: anchorX + hx, y: anchorY + hy,
-                    oldx: anchorX + hx, oldy: anchorY + hy,
-                    homeX: hx, homeY: hy,
-                    isDrip: true
-                });
-            }
-        }
+            device.queue.writeBuffer(uniformBuffer, 0, modelViewProjection);
 
-        function rand(min, max) { return Math.random() * (max - min) + min; }
-
-        // --- UPDATE LOOP ---
-
-        function updatePhysics() {
-            if (wobbleTimer > 0) wobbleTimer--;
-
-            // Main Blob Center Calculation for Stress
-            let avgX = 0, avgY = 0;
-            for(let i=0; i<POINTS; i++) { avgX += points[i].x; avgY += points[i].y; }
-            avgX /= POINTS; avgY /= POINTS;
-
-            // Stress Calc
-            if (isDragging && dragPoint && !dragPoint.isDrip) {
-                let dist = Math.hypot(dragPoint.x - avgX, dragPoint.y - avgY);
-                let base = Math.max(HEAD_RADIUS, Math.hypot(dragPoint.homeX, dragPoint.homeY));
-                currentStress = Math.max(0, Math.min(1, (dist - base) / 100));
-            } else if (!isDragging) {
-                currentStress *= 0.95; // Decay
-            }
-
-            // Update all points
-            for (let i = 0; i < points.length; i++) {
-                let p = points[i];
-
-                if (p === dragPoint) {
-                    p.x = mouseX;
-                    p.y = mouseY;
-                    p.oldx = p.x; p.oldy = p.y;
-                } else {
-                    // Verlet Integration
-                    const vx = (p.x - p.oldx) * VISCOSITY;
-                    const vy = (p.y - p.oldy) * VISCOSITY;
-                    p.oldx = p.x;
-                    p.oldy = p.y;
-                    p.x += vx;
-                    p.y += vy;
-
-                    // Return to Home Force
-                    let tx = anchorX + p.homeX;
-                    let ty = anchorY + p.homeY;
-                    
-                    // Add "breathing" noise to drips
-                    if(p.isDrip) {
-                        tx += Math.sin(Date.now()*0.002 + i)*30;
-                        ty += Math.cos(Date.now()*0.003 + i)*30;
-                    }
-
-                    let dx = tx - p.x;
-                    let dy = ty - p.y;
-                    let strength = p.isDrip ? 0.02 : ELASTICITY;
-                    if(isDragging) strength *= 0.5;
-
-                    p.x += dx * strength;
-                    p.y += dy * strength;
-                }
-
-                // Update GPU Array
-                pointData[i*2] = p.x;
-                pointData[i*2+1] = p.y;
-            }
-
-            // Constraints (Main Blob Only)
-            for(let iter=0; iter<4; iter++) {
-                for(let i=0; i<POINTS; i++) {
-                    let p1 = points[i];
-                    let p2 = points[(i+1)%POINTS];
-                    let dx = p2.x - p1.x;
-                    let dy = p2.y - p1.y;
-                    let dist = Math.hypot(dx, dy);
-                    let diff = p1.nextRestDist - dist;
-                    let percent = diff/dist/2;
-                    let ox = dx*percent*0.9;
-                    let oy = dy*percent*0.9;
-                    
-                    if(p1 !== dragPoint) { p1.x -= ox; p1.y -= oy; }
-                    if(p2 !== dragPoint) { p2.x += ox; p2.y += oy; }
-                }
-            }
-        }
-
-        function drawUI() {
-            uiCtx.clearRect(0, 0, width, height);
-
-            // Calculate Center
-            let avgX = 0, avgY = 0;
-            for(let i=0; i<POINTS; i++) { avgX += points[i].x; avgY += points[i].y; }
-            avgX /= POINTS; avgY /= POINTS;
-
-            // Draw Face
-            const eyeOffset = 60;
-            const eyeSize = 16 + (currentStress * 10);
-            
-            uiCtx.fillStyle = '#2D3436';
-            uiCtx.strokeStyle = '#2D3436';
-            uiCtx.lineWidth = 6;
-            uiCtx.lineCap = 'round';
-
-            let faceY = avgY - 30;
-
-            if (wobbleTimer > 0) {
-                // Dizzy X Eyes
-                drawX(avgX - eyeOffset, faceY);
-                drawX(avgX + eyeOffset, faceY);
-                
-                // Wavy mouth
-                uiCtx.beginPath();
-                uiCtx.moveTo(avgX - 20, faceY + 50);
-                uiCtx.bezierCurveTo(avgX-10, faceY+30, avgX+10, faceY+70, avgX+20, faceY+50);
-                uiCtx.stroke();
-            } else if (currentStress > 0.15) {
-                // Stressed Eyes (Elongated)
-                uiCtx.beginPath();
-                uiCtx.ellipse(avgX - eyeOffset, faceY, eyeSize, eyeSize + currentStress*20, 0, 0, Math.PI*2);
-                uiCtx.ellipse(avgX + eyeOffset, faceY, eyeSize, eyeSize + currentStress*20, 0, 0, Math.PI*2);
-                uiCtx.fill();
-                
-                // O Mouth
-                uiCtx.beginPath();
-                uiCtx.arc(avgX, faceY + 50, 10 + (currentStress*10), 0, Math.PI*2);
-                uiCtx.fill();
-            } else {
-                // Happy Eyes
-                uiCtx.beginPath();
-                uiCtx.arc(avgX - eyeOffset, faceY, eyeSize, 0, Math.PI*2);
-                uiCtx.arc(avgX + eyeOffset, faceY, eyeSize, 0, Math.PI*2);
-                uiCtx.fill();
-
-                // Smile
-                uiCtx.beginPath();
-                uiCtx.arc(avgX, faceY + 40, 25, 0, Math.PI, false);
-                uiCtx.fill();
-                // Tongue
-                uiCtx.fillStyle = '#FF6B6B';
-                uiCtx.beginPath();
-                uiCtx.arc(avgX, faceY + 52, 12, 0, Math.PI, false);
-                uiCtx.fill();
-            }
-        }
-
-        function drawX(x, y) {
-            const s = 15;
-            uiCtx.beginPath();
-            uiCtx.moveTo(x-s, y-s); uiCtx.lineTo(x+s, y+s);
-            uiCtx.moveTo(x+s, y-s); uiCtx.lineTo(x-s, y+s);
-            uiCtx.stroke();
-        }
-
-        function renderLoop() {
-            if(window.isPaused) {
-                requestAnimationFrame(renderLoop);
-                return;
-            }
-
-            updatePhysics();
-            drawUI();
-
-            // --- WEBGPU RENDER PASS ---
-            
-            // 1. Write Points to GPU Buffer
-            device.queue.writeBuffer(pointBuffer, 0, pointData);
-
-            // 2. Write Uniforms
-            const uniformData = new Float32Array([
-                width, height,             // Resolution
-                PALETTE.mint[0], PALETTE.mint[1], PALETTE.mint[2], // Color
-                currentStress,             // Stress
-                performance.now() / 1000,  // Time
-                0 // Padding
-            ]);
-            device.queue.writeBuffer(uniformBuffer, 0, uniformData);
-
-            // 3. Command Encoder
             const commandEncoder = device.createCommandEncoder();
             const textureView = context.getCurrentTexture().createView();
-            
-            const renderPassDescriptor = {
+
+            const passEncoder = commandEncoder.beginRenderPass({
                 colorAttachments: [{
                     view: textureView,
-                    clearValue: { r: 0, g: 0, b: 0, a: 0 }, // Transparent background
+                    // Clear to Dark Gray
+                    clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
                     loadOp: 'clear',
                     storeOp: 'store',
                 }],
-            };
+                depthStencilAttachment: {
+                    view: depthTexture.createView(),
+                    depthClearValue: 1.0,
+                    depthLoadOp: 'clear',
+                    depthStoreOp: 'store',
+                }
+            });
 
-            const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
             passEncoder.setPipeline(pipeline);
-            passEncoder.setBindGroup(0, bindGroup);
-            passEncoder.draw(6); // Draw 6 vertices (Full screen quad)
+            passEncoder.setBindGroup(0, uniformBindGroup);
+            passEncoder.setVertexBuffer(0, vertexBuffer);
+            passEncoder.draw(vertexCount);
             passEncoder.end();
 
             device.queue.submit([commandEncoder.finish()]);
-
-            requestAnimationFrame(renderLoop);
+            requestAnimationFrame(frame);
         }
 
-        // --- INPUT HANDLING ---
-        function handleStart(x, y) {
-            mouseX = x; mouseY = y;
-            let bestDist = 1000;
-            let bestP = null;
-            
-            // Check all points (blob + drips)
-            for(let p of points) {
-                let dist = Math.hypot(p.x - x, p.y - y);
-                if(dist < bestDist && dist < 100) {
-                    bestDist = dist;
-                    bestP = p;
+        // --- FILE INPUT HANDLER ---
+        document.getElementById('model-input').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                const text = event.target.result;
+                try {
+                    const meshData = parseOBJ(text);
+                    if (meshData.length > 0) {
+                        loadMesh(meshData);
+                    } else {
+                        logError("No valid geometry found.");
+                    }
+                } catch (err) {
+                    logError("Error parsing OBJ: " + err.message);
                 }
-            }
-            if(bestP) {
-                isDragging = true;
-                dragPoint = bestP;
-                wobbleTimer = 0;
-            }
-        }
-
-        window.addEventListener('mousedown', e => handleStart(e.clientX, e.clientY));
-        window.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
-        window.addEventListener('mouseup', () => {
-            if(dragPoint && !dragPoint.isDrip && currentStress > 0.15) wobbleTimer = 120;
-            isDragging = false; dragPoint = null;
-        });
-        
-        // Touch support
-        window.addEventListener('touchstart', e => { e.preventDefault(); handleStart(e.touches[0].clientX, e.touches[0].clientY); }, {passive:false});
-        window.addEventListener('touchmove', e => { e.preventDefault(); mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }, {passive:false});
-        window.addEventListener('touchend', () => { 
-            if(dragPoint && !dragPoint.isDrip && currentStress > 0.15) wobbleTimer = 120;
-            isDragging = false; dragPoint = null; 
+            };
+            reader.readAsText(file);
         });
 
-        // Resize
-        window.addEventListener('resize', () => {
-            width = window.innerWidth;
-            height = window.innerHeight;
-            document.getElementById('gpuCanvas').width = width;
-            document.getElementById('gpuCanvas').height = height;
-            uiCanvas.width = width;
-            uiCanvas.height = height;
-            // Re-init physics anchors
-            let dx = width/2 - anchorX;
-            let dy = height/2 - anchorY;
-            anchorX = width/2; anchorY = height/2;
-            points.forEach(p => { p.x+=dx; p.y+=dy; p.oldx+=dx; p.oldy+=dy; });
-        });
-
-        // Pause Toggle (Global var used by pause.js)
-        window.isPaused = false;
-        function togglePauseMenu() {
-            window.isPaused = !window.isPaused;
-            const overlay = document.getElementById('pause-menu-overlay');
-            if(window.isPaused) overlay.classList.remove('hidden');
-            else {
-                overlay.classList.add('hidden');
-                requestAnimationFrame(renderLoop);
-            }
-        }
-
-        // Start
-        initWebGPU();
-
+        init();
     </script>
 </body>
+
 </html>
